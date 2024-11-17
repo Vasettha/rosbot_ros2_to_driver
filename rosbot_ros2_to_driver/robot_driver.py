@@ -6,262 +6,292 @@ from sensor_msgs.msg import JointState
 from tf2_ros import TransformBroadcaster
 import serial
 import math
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 import numpy as np
-from threading import Lock
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
 
 class RobotDriver(Node):
     def __init__(self):
         super().__init__('robot_driver')
         
-        # Robot parameters
-        self.WHEEL_SEPARATION = 0.23  # meters
-        self.WHEEL_RADIUS = 0.0335    # meters
-        self.ENCODER_TICKS_PER_METER = 2343.0
-        self.MAX_LINEAR_SPEED = 0.5   # m/s
-        self.MAX_ANGULAR_SPEED = 2.0  # rad/s
-        self.UPDATE_RATE = 40.0       # Hz
-        self.CMD_TIMEOUT = 0.5        # seconds
-        
-        # Initialize serial communication
-        self._init_serial()
-        
-        # Initialize publishers, subscribers and broadcasters
-        self._init_ros_interfaces()
-        
-        # Initialize state variables
-        self._init_state()
-        
-        # Create timers
-        self.update_timer = self.create_timer(1.0/self.UPDATE_RATE, self.update_robot_state)
-        self.watchdog_timer = self.create_timer(0.1, self.watchdog)
-        
-        self.get_logger().info('Robot driver initialized successfully')
-
-    def _init_serial(self):
+        # Configure serial connection
         try:
-            self.serial_lock = Lock()
             self.serial_port = serial.Serial(
                 port='/dev/ttyUSB1',
                 baudrate=115200,
-                timeout=0.01,
-                write_timeout=0.01
+                timeout=0.1,
+                writeTimeout=0.1
             )
-            self.serial_port.reset_input_buffer()
-            self.serial_port.reset_output_buffer()
         except serial.SerialException as e:
-            self.get_logger().error(f'Failed to initialize serial port: {e}')
-            raise
+            self.get_logger().error(f'Failed to open serial port: {e}')
+            raise e
 
-    def _init_ros_interfaces(self):
-        # Configure QoS profiles
+        # Robot physical parameters
+        self.WHEEL_SEPARATION = 0.23  # meters
+        self.WHEEL_RADIUS = 0.0335    # meters (from your URDF)
+        self.PULSES_PER_METER = 2343.0
+        self.MAX_SPEED_PULSE_PER_LOOP = 25
+        self.PID_LOOPS_PER_SECOND = 40
+
+        # QoS profile for odometry and joint states
         odom_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT
         )
-        
-        cmd_vel_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
-        
-        # Publishers
-        self.odom_pub = self.create_publisher(Odometry, 'odom', odom_qos)
-        self.joint_pub = self.create_publisher(JointState, 'joint_states', 10)
-        
-        # Subscribers
-        self.cmd_vel_sub = self.create_subscription(
-            Twist, 'cmd_vel', self.cmd_vel_callback, cmd_vel_qos)
-            
-        # Transform broadcaster
-        self.tf_broadcaster = TransformBroadcaster(self)
 
-    def _init_state(self):
+        # Publishers, subscribers and broadcasters
+        self.cmd_vel_sub = self.create_subscription(
+            Twist,
+            'cmd_vel',
+            self.cmd_vel_callback,
+            10
+        )
+        self.odom_pub = self.create_publisher(
+            Odometry,
+            'odom',
+            odom_qos
+        )
+        self.joint_pub = self.create_publisher(
+            JointState,
+            'joint_states',
+            10
+        )
+        self.odom_broadcaster = TransformBroadcaster(self)
+
+        # Robot state variables
         self.pose = {'x': 0.0, 'y': 0.0, 'theta': 0.0}
         self.twist = {'linear': 0.0, 'angular': 0.0}
-        self.encoder_readings = {'left': 0, 'right': 0}
-        self.last_cmd_time = self.get_clock().now()
-        self.last_cmd = (0, 0)
+        self.last_encoder_readings = {'left': 0.0, 'right': 0.0}
+        self.wheel_positions = {'left': 0.0, 'right': 0.0}  # Accumulated wheel rotations
+        self.current_time = self.get_clock().now()
+        self.last_time = self.current_time
 
+        # Create timers
+        self.create_timer(0.02, self.update_odometry)  # 50Hz for odometry updates
+        self.create_timer(0.1, self.watchdog_timer)    # 10Hz for watchdog
+        
+        # Watchdog for cmd_vel
+        self.last_cmd_time = self.get_clock().now()
+        self.CMD_TIMEOUT = 0.5  # seconds
+        
+        self.get_logger().info('Robot driver initialized')
+        
     def cmd_vel_callback(self, msg):
+        """
+        Handle incoming velocity commands.
+        Converts linear and angular velocities to wheel speeds.
+        """
         try:
+            # Update command timestamp
             self.last_cmd_time = self.get_clock().now()
             
-            # Apply speed limits
-            linear = np.clip(msg.linear.x, -self.MAX_LINEAR_SPEED, self.MAX_LINEAR_SPEED)
-            angular = np.clip(msg.angular.z, -self.MAX_ANGULAR_SPEED, self.MAX_ANGULAR_SPEED)
-            
-            # Calculate wheel velocities (in m/s)
-            left_speed = linear - (angular * self.WHEEL_SEPARATION / 2.0)
-            right_speed = linear + (angular * self.WHEEL_SEPARATION / 2.0)
-            
-            # Convert to encoder ticks per control loop (25ms)
-            left_ticks = int(left_speed * self.ENCODER_TICKS_PER_METER * 0.025)
-            right_ticks = int(right_speed * self.ENCODER_TICKS_PER_METER * 0.025)
-            
-            # Send command if different from last
-            if (left_ticks, right_ticks) != self.last_cmd:
-                command = f"m {left_ticks} {right_ticks}\n"
-                self._send_serial_command(command)
-                self.last_cmd = (left_ticks, right_ticks)
-                
+            # Convert velocity commands to wheel speeds
+            linear_speed = msg.linear.x * self.PULSES_PER_METER / self.PID_LOOPS_PER_SECOND
+            angular_speed = msg.angular.z * self.WHEEL_SEPARATION / 2 * self.PULSES_PER_METER / self.PID_LOOPS_PER_SECOND
+
+            # Calculate individual wheel speeds
+            left_speed = int(linear_speed - angular_speed)
+            right_speed = int(linear_speed + angular_speed)
+
+            # Clamp speeds to maximum allowed values
+            left_speed = np.clip(left_speed, -self.MAX_SPEED_PULSE_PER_LOOP, self.MAX_SPEED_PULSE_PER_LOOP)
+            right_speed = np.clip(right_speed, -self.MAX_SPEED_PULSE_PER_LOOP, self.MAX_SPEED_PULSE_PER_LOOP)
+
+            # Send command to robot
+            command = f"m {left_speed} {right_speed}\n"
+            self.serial_port.write(command.encode())
+            self.serial_port.flush()
+
+        except serial.SerialException as e:
+            self.get_logger().error(f'Serial communication error in cmd_vel: {e}')
         except Exception as e:
             self.get_logger().error(f'Error in cmd_vel callback: {e}')
 
-    def _send_serial_command(self, command):
+    def read_encoders(self):
+        """
+        Request and read encoder values from the robot.
+        Returns tuple of (left_mm, right_mm) or None if error occurs.
+        """
         try:
-            with self.serial_lock:
-                self.serial_port.write(command.encode())
-                return True
-        except serial.SerialException as e:
-            self.get_logger().error(f'Serial write error: {e}')
-            return False
-
-    def _read_encoders(self):
-        try:
-            with self.serial_lock:
-                self.serial_port.write(b"e\n")
-                response = self.serial_port.readline().decode().strip()
+            # Clear any pending data
+            self.serial_port.reset_input_buffer()
+            
+            # Send encoder read command
+            self.serial_port.write(b"e\n")
+            self.serial_port.flush()
+            
+            # Read response
+            response = self.serial_port.readline().decode().strip()
+            
+            if not response:
+                return None
                 
-                if not response:
-                    return None
-                    
-                try:
-                    parts = response.split()
-                    left_mm = float(parts[3])
-                    right_mm = float(parts[7])
-                    return (left_mm / 1000.0, right_mm / 1000.0)  # Convert to meters
-                except (ValueError, IndexError):
-                    return None
-                    
-        except serial.SerialException as e:
-            self.get_logger().error(f'Serial read error: {e}')
+            # Parse encoder values
+            left_str, right_str = response.split("Right encoder (mm):")
+            left_mm = float(left_str.split("Left encoder (mm):")[1].strip())
+            right_mm = float(right_str.strip())
+            
+            return (left_mm, right_mm)
+            
+        except (serial.SerialException, ValueError, IndexError) as e:
+            self.get_logger().error(f'Error reading encoders: {e}')
             return None
 
-    def update_robot_state(self):
+    def publish_joint_states(self, d_left, d_right, dt):
+        """
+        Publish joint states for the wheels.
+        """
         try:
-            # Read encoders
-            encoder_vals = self._read_encoders()
-            if not encoder_vals:
-                return
-                
-            # Calculate changes
-            d_left = encoder_vals[0] - self.encoder_readings['left']
-            d_right = encoder_vals[1] - self.encoder_readings['right']
-            
-            # Update stored readings
-            self.encoder_readings['left'] = encoder_vals[0]
-            self.encoder_readings['right'] = encoder_vals[1]
-            
-            # Calculate odometry
-            d_center = (d_right + d_left) / 2.0
-            d_theta = (d_right - d_left) / self.WHEEL_SEPARATION
-            
-            # Update pose
-            theta = self.pose['theta'] + d_theta
-            self.pose['theta'] = theta
-            self.pose['x'] += d_center * math.cos(theta)
-            self.pose['y'] += d_center * math.sin(theta)
-            
-            # Calculate velocities
-            dt = 1.0 / self.UPDATE_RATE
-            self.twist['linear'] = d_center / dt
-            self.twist['angular'] = d_theta / dt
-            
-            # Publish updates
-            self._publish_odometry()
-            self._publish_joint_states(d_left, d_right, dt)
-            
-        except Exception as e:
-            self.get_logger().error(f'Error updating robot state: {e}')
+            # Calculate wheel positions (accumulated angle)
+            self.wheel_positions['left'] += d_left / self.WHEEL_RADIUS  # distance/radius = angle in radians
+            self.wheel_positions['right'] += d_right / self.WHEEL_RADIUS
 
-    def _publish_odometry(self):
-        try:
-            now = self.get_clock().now()
-            
-            # Create and publish transform
-            transform = TransformStamped()
-            transform.header.stamp = now.to_msg()
-            transform.header.frame_id = 'odom'
-            transform.child_frame_id = 'base_link'
-            
-            transform.transform.translation.x = self.pose['x']
-            transform.transform.translation.y = self.pose['y']
-            transform.transform.translation.z = 0.0
-            
-            # Calculate quaternion
-            theta_2 = self.pose['theta'] / 2.0
-            transform.transform.rotation.z = math.sin(theta_2)
-            transform.transform.rotation.w = math.cos(theta_2)
-            
-            # Broadcast transform
-            self.tf_broadcaster.sendTransform(transform)
-            
-            # Create and publish odometry
-            odom = Odometry()
-            odom.header = transform.header
-            odom.child_frame_id = transform.child_frame_id
-            
-            odom.pose.pose.position.x = self.pose['x']
-            odom.pose.pose.position.y = self.pose['y']
-            odom.pose.pose.orientation = transform.transform.rotation
-            
-            odom.twist.twist.linear.x = self.twist['linear']
-            odom.twist.twist.angular.z = self.twist['angular']
-            
-            self.odom_pub.publish(odom)
-            
-        except Exception as e:
-            self.get_logger().error(f'Error publishing odometry: {e}')
+            # Calculate wheel velocities
+            left_velocity = d_left / (dt * self.WHEEL_RADIUS) if dt > 0 else 0
+            right_velocity = d_right / (dt * self.WHEEL_RADIUS) if dt > 0 else 0
 
-    def _publish_joint_states(self, d_left, d_right, dt):
-        try:
-            msg = JointState()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.name = ['left_wheel_joint', 'right_wheel_joint']
-            
-            # Calculate wheel angles from distance
-            angle_left = d_left / self.WHEEL_RADIUS
-            angle_right = d_right / self.WHEEL_RADIUS
-            
-            msg.position = [angle_left, angle_right]
-            msg.velocity = [angle_left/dt, angle_right/dt]
-            
-            self.joint_pub.publish(msg)
-            
+            # Create joint state message
+            joint_state = JointState()
+            joint_state.header.stamp = self.current_time.to_msg()
+            joint_state.name = ['left_wheel_joint', 'right_wheel_joint']
+            joint_state.position = [self.wheel_positions['left'], self.wheel_positions['right']]
+            joint_state.velocity = [left_velocity, right_velocity]
+            joint_state.effort = []  # We don't have effort sensing
+
+            # Publish joint states
+            self.joint_pub.publish(joint_state)
+
         except Exception as e:
             self.get_logger().error(f'Error publishing joint states: {e}')
 
-    def watchdog(self):
+    def update_odometry(self):
+        """
+        Update robot odometry based on encoder readings.
+        Publishes odometry data and broadcasts transforms.
+        """
+        try:
+            # Read encoder values
+            encoder_readings = self.read_encoders()
+            if encoder_readings is None:
+                return
+
+            # Convert mm to meters
+            left_m = encoder_readings[0] / 1000.0
+            right_m = encoder_readings[1] / 1000.0
+
+            # Calculate wheel travel distances since last update
+            d_left = left_m - self.last_encoder_readings['left']
+            d_right = right_m - self.last_encoder_readings['right']
+
+            # Update stored encoder readings
+            self.last_encoder_readings['left'] = left_m
+            self.last_encoder_readings['right'] = right_m
+
+            # Calculate robot movement
+            d_center = (d_right + d_left) / 2.0
+            d_theta = (d_right - d_left) / self.WHEEL_SEPARATION
+
+            # Get current time and time difference
+            self.current_time = self.get_clock().now()
+            dt = (self.current_time - self.last_time).nanoseconds / 1e9
+
+            # Publish joint states
+            self.publish_joint_states(d_left, d_right, dt)
+
+            # Update robot pose
+            self.pose['theta'] = (self.pose['theta'] + d_theta) % (2 * math.pi)
+            self.pose['x'] += d_center * math.cos(self.pose['theta'])
+            self.pose['y'] += d_center * math.sin(self.pose['theta'])
+
+            if dt > 0:
+                self.twist['linear'] = d_center / dt
+                self.twist['angular'] = d_theta / dt
+
+            # Create and publish odometry message
+            odom_msg = Odometry()
+            odom_msg.header.stamp = self.current_time.to_msg()
+            odom_msg.header.frame_id = 'odom'
+            odom_msg.child_frame_id = 'base_link'
+
+            # Set position
+            odom_msg.pose.pose.position.x = self.pose['x']
+            odom_msg.pose.pose.position.y = self.pose['y']
+            odom_msg.pose.pose.position.z = 0.0
+
+            # Set orientation
+            odom_msg.pose.pose.orientation.z = math.sin(self.pose['theta'] / 2.0)
+            odom_msg.pose.pose.orientation.w = math.cos(self.pose['theta'] / 2.0)
+
+            # Set velocities
+            odom_msg.twist.twist.linear.x = self.twist['linear']
+            odom_msg.twist.twist.angular.z = self.twist['angular']
+
+            # Publish odometry message
+            self.odom_pub.publish(odom_msg)
+
+            # Broadcast transform
+            transform_msg = TransformStamped()
+            transform_msg.header.stamp = self.current_time.to_msg()
+            transform_msg.header.frame_id = 'odom'
+            transform_msg.child_frame_id = 'base_link'
+            
+            transform_msg.transform.translation.x = self.pose['x']
+            transform_msg.transform.translation.y = self.pose['y']
+            transform_msg.transform.translation.z = 0.0
+            
+            transform_msg.transform.rotation.z = math.sin(self.pose['theta'] / 2.0)
+            transform_msg.transform.rotation.w = math.cos(self.pose['theta'] / 2.0)
+
+            self.odom_broadcaster.sendTransform(transform_msg)
+
+            # Update last time
+            self.last_time = self.current_time
+
+        except Exception as e:
+            self.get_logger().error(f'Error updating odometry: {e}')
+
+    def watchdog_timer(self):
+        """
+        Monitor command velocity timeout and stop robot if necessary.
+        """
         try:
             if (self.get_clock().now() - self.last_cmd_time).nanoseconds / 1e9 > self.CMD_TIMEOUT:
-                if self.last_cmd != (0, 0):
-                    self._send_serial_command("s\n")
-                    self.last_cmd = (0, 0)
-        except Exception as e:
-            self.get_logger().error(f'Watchdog error: {e}')
+                # Stop the robot
+                self.serial_port.write(b"s\n")
+                self.serial_port.flush()
+        except serial.SerialException as e:
+            self.get_logger().error(f'Serial error in watchdog: {e}')
 
     def cleanup(self):
+        """
+        Clean up resources before node shutdown.
+        """
         try:
-            self._send_serial_command("s\n")
+            # Stop the robot
+            self.serial_port.write(b"s\n")
+            self.serial_port.flush()
+            # Close serial port
             self.serial_port.close()
-        except Exception as e:
-            self.get_logger().error(f'Cleanup error: {e}')
+        except serial.SerialException as e:
+            self.get_logger().error(f'Error during cleanup: {e}')
 
-def main():
-    rclpy.init()
+
+def main(args=None):
+    rclpy.init(args=args)
+    
     driver = RobotDriver()
     
     try:
         rclpy.spin(driver)
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        driver.get_logger().error(f'Unexpected error: {e}')
     finally:
         driver.cleanup()
         driver.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
