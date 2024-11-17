@@ -165,6 +165,117 @@ class RobotDriver(Node):
             self.get_logger().error(f'Serial error reading encoders: {e}')
             return None
 
+    def publish_joint_states(self, d_left, d_right, dt):
+        """Publish joint states for the wheels"""
+        try:
+            # Calculate wheel positions (accumulated angle)
+            self.wheel_positions['left'] += d_left / self.WHEEL_RADIUS
+            self.wheel_positions['right'] += d_right / self.WHEEL_RADIUS
+
+            # Calculate wheel velocities
+            left_velocity = d_left / (dt * self.WHEEL_RADIUS) if dt > 0 else 0
+            right_velocity = d_right / (dt * self.WHEEL_RADIUS) if dt > 0 else 0
+
+            # Create joint state message
+            joint_state = JointState()
+            joint_state.header.stamp = self.current_time.to_msg()
+            joint_state.name = ['left_wheel_joint', 'right_wheel_joint']
+            joint_state.position = [self.wheel_positions['left'], self.wheel_positions['right']]
+            joint_state.velocity = [left_velocity, right_velocity]
+            joint_state.effort = []
+
+            # Publish joint states
+            self.joint_pub.publish(joint_state)
+
+        except Exception as e:
+            self.get_logger().error(f'Error publishing joint states: {e}')
+
+    def update_odometry(self):
+        """Update robot odometry based on encoder readings"""
+        try:
+            # Read encoder values
+            encoder_readings = self.read_encoders()
+            if encoder_readings is None:
+                self.get_logger().debug('Failed to read encoders, skipping odometry update')
+                return
+
+            # Convert mm to meters
+            left_m = encoder_readings[0] / 1000.0
+            right_m = encoder_readings[1] / 1000.0
+
+            # Calculate wheel travel distances since last update
+            d_left = left_m - self.last_encoder_readings['left']
+            d_right = right_m - self.last_encoder_readings['right']
+
+            # Update stored encoder readings
+            self.last_encoder_readings['left'] = left_m
+            self.last_encoder_readings['right'] = right_m
+
+            # Calculate robot movement
+            d_center = (d_right + d_left) / 2.0
+            d_theta = (d_right - d_left) / self.WHEEL_SEPARATION
+
+            # Get current time and time difference
+            self.current_time = self.get_clock().now()
+            dt = (self.current_time - self.last_time).nanoseconds / 1e9
+
+            # Only proceed if we have a valid time difference
+            if dt > 0:
+                # Publish joint states
+                self.publish_joint_states(d_left, d_right, dt)
+
+                # Update robot pose
+                self.pose['theta'] = (self.pose['theta'] + d_theta) % (2 * math.pi)
+                self.pose['x'] += d_center * math.cos(self.pose['theta'])
+                self.pose['y'] += d_center * math.sin(self.pose['theta'])
+
+                # Update twist
+                self.twist['linear'] = d_center / dt
+                self.twist['angular'] = d_theta / dt
+
+                # Create and publish odometry message
+                odom_msg = Odometry()
+                odom_msg.header.stamp = self.current_time.to_msg()
+                odom_msg.header.frame_id = 'odom'
+                odom_msg.child_frame_id = 'base_link'
+
+                # Set position
+                odom_msg.pose.pose.position.x = self.pose['x']
+                odom_msg.pose.pose.position.y = self.pose['y']
+                odom_msg.pose.pose.position.z = 0.0
+
+                # Set orientation (using theta for simple 2D rotation)
+                odom_msg.pose.pose.orientation.z = math.sin(self.pose['theta'] / 2.0)
+                odom_msg.pose.pose.orientation.w = math.cos(self.pose['theta'] / 2.0)
+
+                # Set velocities
+                odom_msg.twist.twist.linear.x = self.twist['linear']
+                odom_msg.twist.twist.angular.z = self.twist['angular']
+
+                # Publish odometry message
+                self.odom_pub.publish(odom_msg)
+
+                # Broadcast transform
+                transform_msg = TransformStamped()
+                transform_msg.header.stamp = self.current_time.to_msg()
+                transform_msg.header.frame_id = 'odom'
+                transform_msg.child_frame_id = 'base_link'
+                
+                transform_msg.transform.translation.x = self.pose['x']
+                transform_msg.transform.translation.y = self.pose['y']
+                transform_msg.transform.translation.z = 0.0
+                
+                transform_msg.transform.rotation.z = math.sin(self.pose['theta'] / 2.0)
+                transform_msg.transform.rotation.w = math.cos(self.pose['theta'] / 2.0)
+
+                self.odom_broadcaster.sendTransform(transform_msg)
+
+                # Update last time
+                self.last_time = self.current_time
+
+        except Exception as e:
+            self.get_logger().error(f'Error updating odometry: {e}')
+
     def watchdog_timer(self):
         """Monitor command velocity timeout"""
         try:
@@ -183,8 +294,6 @@ class RobotDriver(Node):
             self.serial_port.close()
         except Exception as e:
             self.get_logger().error(f'Error during cleanup: {e}')
-
-    # ... rest of the methods (update_odometry, publish_joint_states) remain the same ...
 
 def main(args=None):
     rclpy.init(args=args)
