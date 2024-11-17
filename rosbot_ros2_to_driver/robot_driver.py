@@ -17,8 +17,8 @@ class RobotDriver(Node):
         # Configure serial connection
         try:
             self.serial_port = serial.Serial(
-                port='/dev/ttyUSB0',
-                baudrate=9600,
+                port='/dev/ttyUSB1',
+                baudrate=115200,
                 timeout=0.1,
                 writeTimeout=0.1
             )
