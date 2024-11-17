@@ -108,34 +108,59 @@ class RobotDriver(Node):
             self.get_logger().error(f'Error in cmd_vel callback: {e}')
 
     def read_encoders(self):
-        """
-        Request and read encoder values from the robot.
-        Returns tuple of (left_mm, right_mm) or None if error occurs.
-        """
+    """
+    Request and read encoder values from the robot.
+    Returns tuple of (left_mm, right_mm) or None if error occurs.
+    """
+    try:
+        # Clear any pending data
+        self.serial_port.reset_input_buffer()
+        
+        # Send encoder read command
+        self.serial_port.write(b"e\n")
+        self.serial_port.flush()
+        
+        # Read response
+        response = self.serial_port.readline().decode().strip()
+        
+        if not response:
+            return None
+            
+        # Parse encoder values
+        # Example format: "Left encoder (mm): 123.45 Right encoder (mm): 678.90"
         try:
-            # Clear any pending data
-            self.serial_port.reset_input_buffer()
-            
-            # Send encoder read command
-            self.serial_port.write(b"e\n")
-            self.serial_port.flush()
-            
-            # Read response
-            response = self.serial_port.readline().decode().strip()
-            
-            if not response:
+            # Split the string at "Right encoder"
+            parts = response.split("Right encoder")
+            if len(parts) != 2:
+                self.get_logger().error(f'Invalid encoder response format: {response}')
                 return None
                 
-            # Parse encoder values
-            left_str, right_str = response.split("Right encoder (mm):")
-            left_mm = float(left_str.split("Left encoder (mm):")[1].strip())
-            right_mm = float(right_str.strip())
+            # Extract left value
+            left_part = parts[0].split("Left encoder (mm):")
+            if len(left_part) != 2:
+                self.get_logger().error(f'Invalid left encoder format: {parts[0]}')
+                return None
+            left_mm = float(left_part[1].strip())
+            
+            # Extract right value
+            right_part = parts[1].split(":")
+            if len(right_part) != 2:
+                self.get_logger().error(f'Invalid right encoder format: {parts[1]}')
+                return None
+            right_mm = float(right_part[1].strip())
             
             return (left_mm, right_mm)
             
-        except (serial.SerialException, ValueError, IndexError) as e:
-            self.get_logger().error(f'Error reading encoders: {e}')
+        except ValueError as ve:
+            self.get_logger().error(f'Error parsing encoder values: {ve}')
             return None
+            
+    except serial.SerialException as e:
+        self.get_logger().error(f'Serial error reading encoders: {e}')
+        return None
+    except Exception as e:
+        self.get_logger().error(f'Unexpected error reading encoders: {e}')
+        return None
 
     def publish_joint_states(self, d_left, d_right, dt):
         """
