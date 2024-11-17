@@ -75,6 +75,37 @@ class RobotDriver(Node):
         self.CMD_TIMEOUT = 0.5  # seconds
         
         self.get_logger().info('Robot driver initialized')
+        
+    def cmd_vel_callback(self, msg):
+        """
+        Handle incoming velocity commands.
+        Converts linear and angular velocities to wheel speeds.
+        """
+        try:
+            # Update command timestamp
+            self.last_cmd_time = self.get_clock().now()
+            
+            # Convert velocity commands to wheel speeds
+            linear_speed = msg.linear.x * self.PULSES_PER_METER / self.PID_LOOPS_PER_SECOND
+            angular_speed = msg.angular.z * self.WHEEL_SEPARATION / 2 * self.PULSES_PER_METER / self.PID_LOOPS_PER_SECOND
+
+            # Calculate individual wheel speeds
+            left_speed = int(linear_speed - angular_speed)
+            right_speed = int(linear_speed + angular_speed)
+
+            # Clamp speeds to maximum allowed values
+            left_speed = np.clip(left_speed, -self.MAX_SPEED_PULSE_PER_LOOP, self.MAX_SPEED_PULSE_PER_LOOP)
+            right_speed = np.clip(right_speed, -self.MAX_SPEED_PULSE_PER_LOOP, self.MAX_SPEED_PULSE_PER_LOOP)
+
+            # Send command to robot
+            command = f"m {left_speed} {right_speed}\n"
+            self.serial_port.write(command.encode())
+            self.serial_port.flush()
+
+        except serial.SerialException as e:
+            self.get_logger().error(f'Serial communication error in cmd_vel: {e}')
+        except Exception as e:
+            self.get_logger().error(f'Error in cmd_vel callback: {e}')
 
     def read_encoders(self):
         """
