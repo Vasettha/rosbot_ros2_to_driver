@@ -8,6 +8,7 @@ import serial
 import math
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 import numpy as np
+import time
 
 
 class RobotDriver(Node):
@@ -106,7 +107,7 @@ class RobotDriver(Node):
             self.serial_port.flush()
             
             # Add a small delay to ensure command is sent
-            self.get_clock().sleep_for(Duration(nanoseconds=1000000))  # 1ms delay
+            time.sleep(0.001)  # 1ms delay
     
         except serial.SerialException as e:
             self.get_logger().error(f'Serial communication error in cmd_vel: {e}')
