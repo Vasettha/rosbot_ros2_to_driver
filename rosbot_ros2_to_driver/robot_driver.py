@@ -155,12 +155,12 @@ class RobotDriver(Node):
             self.get_logger().error(f'Error parsing encoder values: {ve}')
             return None
             
-    except serial.SerialException as e:
-        self.get_logger().error(f'Serial error reading encoders: {e}')
-        return None
-    except Exception as e:
-        self.get_logger().error(f'Unexpected error reading encoders: {e}')
-        return None
+        except serial.SerialException as e:
+            self.get_logger().error(f'Serial error reading encoders: {e}')
+            return None
+        except Exception as e:
+            self.get_logger().error(f'Unexpected error reading encoders: {e}')
+            return None
 
     def publish_joint_states(self, d_left, d_right, dt):
         """
