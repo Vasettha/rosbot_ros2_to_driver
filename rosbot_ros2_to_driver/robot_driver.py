@@ -9,7 +9,6 @@ import math
 import numpy as np
 from threading import Lock
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from rclpy.duration import Duration
 
 class RobotDriver(Node):
     def __init__(self):
@@ -21,7 +20,7 @@ class RobotDriver(Node):
         self.ENCODER_TICKS_PER_METER = 2343.0
         self.MAX_LINEAR_SPEED = 0.5   # m/s
         self.MAX_ANGULAR_SPEED = 2.0  # rad/s
-        self.UPDATE_RATE = 50.0       # Hz
+        self.UPDATE_RATE = 40.0       # Hz
         self.CMD_TIMEOUT = 0.5        # seconds
         
         # Initialize serial communication
@@ -40,16 +39,14 @@ class RobotDriver(Node):
         self.get_logger().info('Robot driver initialized successfully')
 
     def _init_serial(self):
-        """Initialize serial communication with robust error handling"""
         try:
             self.serial_lock = Lock()
             self.serial_port = serial.Serial(
                 port='/dev/ttyUSB1',
                 baudrate=115200,
-                timeout=0.02,  # Reduced timeout for faster response
-                write_timeout=0.02
+                timeout=0.01,
+                write_timeout=0.01
             )
-            # Clear buffers
             self.serial_port.reset_input_buffer()
             self.serial_port.reset_output_buffer()
         except serial.SerialException as e:
@@ -57,7 +54,6 @@ class RobotDriver(Node):
             raise
 
     def _init_ros_interfaces(self):
-        """Initialize all ROS interfaces with appropriate QoS settings"""
         # Configure QoS profiles
         odom_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -83,7 +79,6 @@ class RobotDriver(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
     def _init_state(self):
-        """Initialize robot state variables"""
         self.pose = {'x': 0.0, 'y': 0.0, 'theta': 0.0}
         self.twist = {'linear': 0.0, 'angular': 0.0}
         self.encoder_readings = {'left': 0, 'right': 0}
@@ -91,9 +86,7 @@ class RobotDriver(Node):
         self.last_cmd = (0, 0)
 
     def cmd_vel_callback(self, msg):
-        """Process velocity commands with speed limiting and efficient encoding"""
         try:
-            # Update command timestamp
             self.last_cmd_time = self.get_clock().now()
             
             # Apply speed limits
@@ -104,9 +97,9 @@ class RobotDriver(Node):
             left_speed = linear - (angular * self.WHEEL_SEPARATION / 2.0)
             right_speed = linear + (angular * self.WHEEL_SEPARATION / 2.0)
             
-            # Convert to encoder ticks per control loop
-            left_ticks = int(left_speed * self.ENCODER_TICKS_PER_METER / 40)  # 40Hz control loop
-            right_ticks = int(right_speed * self.ENCODER_TICKS_PER_METER / 40)
+            # Convert to encoder ticks per control loop (25ms)
+            left_ticks = int(left_speed * self.ENCODER_TICKS_PER_METER * 0.025)
+            right_ticks = int(right_speed * self.ENCODER_TICKS_PER_METER * 0.025)
             
             # Send command if different from last
             if (left_ticks, right_ticks) != self.last_cmd:
@@ -118,7 +111,6 @@ class RobotDriver(Node):
             self.get_logger().error(f'Error in cmd_vel callback: {e}')
 
     def _send_serial_command(self, command):
-        """Send command to robot with efficient error handling"""
         try:
             with self.serial_lock:
                 self.serial_port.write(command.encode())
@@ -128,7 +120,6 @@ class RobotDriver(Node):
             return False
 
     def _read_encoders(self):
-        """Read encoder values with efficient parsing"""
         try:
             with self.serial_lock:
                 self.serial_port.write(b"e\n")
@@ -137,25 +128,19 @@ class RobotDriver(Node):
                 if not response:
                     return None
                     
-                # Fast string parsing without split()
-                left_start = response.find(":") + 1
-                right_start = response.find(":", left_start) + 1
-                
-                if left_start > 0 and right_start > 0:
-                    try:
-                        left_mm = float(response[left_start:response.find(" Right")].strip())
-                        right_mm = float(response[right_start:].strip())
-                        return (left_mm / 1000.0, right_mm / 1000.0)  # Convert to meters
-                    except ValueError:
-                        return None
-                return None
-                
+                try:
+                    parts = response.split()
+                    left_mm = float(parts[3])
+                    right_mm = float(parts[7])
+                    return (left_mm / 1000.0, right_mm / 1000.0)  # Convert to meters
+                except (ValueError, IndexError):
+                    return None
+                    
         except serial.SerialException as e:
             self.get_logger().error(f'Serial read error: {e}')
             return None
 
     def update_robot_state(self):
-        """Update robot state with efficient odometry calculation"""
         try:
             # Read encoders
             encoder_vals = self._read_encoders()
@@ -193,9 +178,7 @@ class RobotDriver(Node):
             self.get_logger().error(f'Error updating robot state: {e}')
 
     def _publish_odometry(self):
-        """Publish odometry with efficient message creation"""
         try:
-            # Create stamped message
             now = self.get_clock().now()
             
             # Create and publish transform
@@ -204,7 +187,6 @@ class RobotDriver(Node):
             transform.header.frame_id = 'odom'
             transform.child_frame_id = 'base_link'
             
-            # Set translation
             transform.transform.translation.x = self.pose['x']
             transform.transform.translation.y = self.pose['y']
             transform.transform.translation.z = 0.0
@@ -222,7 +204,6 @@ class RobotDriver(Node):
             odom.header = transform.header
             odom.child_frame_id = transform.child_frame_id
             
-            # Copy pose and twist
             odom.pose.pose.position.x = self.pose['x']
             odom.pose.pose.position.y = self.pose['y']
             odom.pose.pose.orientation = transform.transform.rotation
@@ -236,7 +217,6 @@ class RobotDriver(Node):
             self.get_logger().error(f'Error publishing odometry: {e}')
 
     def _publish_joint_states(self, d_left, d_right, dt):
-        """Publish joint states efficiently"""
         try:
             msg = JointState()
             msg.header.stamp = self.get_clock().now().to_msg()
@@ -255,7 +235,6 @@ class RobotDriver(Node):
             self.get_logger().error(f'Error publishing joint states: {e}')
 
     def watchdog(self):
-        """Monitor command timeout"""
         try:
             if (self.get_clock().now() - self.last_cmd_time).nanoseconds / 1e9 > self.CMD_TIMEOUT:
                 if self.last_cmd != (0, 0):
@@ -265,7 +244,6 @@ class RobotDriver(Node):
             self.get_logger().error(f'Watchdog error: {e}')
 
     def cleanup(self):
-        """Clean up resources"""
         try:
             self._send_serial_command("s\n")
             self.serial_port.close()
