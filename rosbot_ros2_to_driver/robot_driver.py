@@ -126,35 +126,40 @@ class RobotDriver(Node):
             if not response:
                 return None
                 
-            # Parse encoder values
-            # Example format: "Left encoder (mm): 123.45 Right encoder (mm): 678.90"
-            try:
-                # Split the string at "Right encoder"
-                parts = response.split("Right encoder")
-                if len(parts) != 2:
-                    self.get_logger().error(f'Invalid encoder response format: {response}')
-                    return None
+            # Only try to parse if the response contains the expected format
+            if "Left encoder (mm):" in response and "Right encoder (mm):" in response:
+                # Parse encoder values
+                try:
+                    # Split the string at "Right encoder"
+                    parts = response.split("Right encoder")
+                    if len(parts) != 2:
+                        self.get_logger().debug(f'Skipping invalid encoder response format: {response}')
+                        return None
+                        
+                    # Extract left value
+                    left_part = parts[0].split("Left encoder (mm):")
+                    if len(left_part) != 2:
+                        self.get_logger().debug(f'Skipping invalid left encoder format: {parts[0]}')
+                        return None
+                    left_mm = float(left_part[1].strip())
                     
-                # Extract left value
-                left_part = parts[0].split("Left encoder (mm):")
-                if len(left_part) != 2:
-                    self.get_logger().error(f'Invalid left encoder format: {parts[0]}')
+                    # Extract right value
+                    right_part = parts[1].split(":")
+                    if len(right_part) != 2:
+                        self.get_logger().debug(f'Skipping invalid right encoder format: {parts[1]}')
+                        return None
+                    right_mm = float(right_part[1].strip())
+                    
+                    return (left_mm, right_mm)
+                    
+                except ValueError as ve:
+                    self.get_logger().debug(f'Error parsing encoder values: {ve}')
                     return None
-                left_mm = float(left_part[1].strip())
-                
-                # Extract right value
-                right_part = parts[1].split(":")
-                if len(right_part) != 2:
-                    self.get_logger().error(f'Invalid right encoder format: {parts[1]}')
-                    return None
-                right_mm = float(right_part[1].strip())
-                
-                return (left_mm, right_mm)
-                
-            except ValueError as ve:
-                self.get_logger().error(f'Error parsing encoder values: {ve}')
+            else:
+                # If response doesn't contain expected format, just return None
+                self.get_logger().debug(f'Unexpected response format: {response}')
                 return None
-                
+                    
         except serial.SerialException as e:
             self.get_logger().error(f'Serial error reading encoders: {e}')
             return None
