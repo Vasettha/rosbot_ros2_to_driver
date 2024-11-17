@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'my_robot_driver'
+package_name = 'rosbot_ros2_to_driver'
 
 setup(
     name=package_name,
@@ -20,7 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'robot_driver = my_robot_driver.robot_driver:main'
+            'robot_driver = rosbot_ros2_to_driver.robot_driver:main'
         ],
     },
 )
