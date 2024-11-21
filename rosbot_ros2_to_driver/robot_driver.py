@@ -18,10 +18,12 @@ class RobotDriver(Node):
         # Robot physical parameters
         self.WHEEL_SEPARATION = 0.23  # meters
         self.WHEEL_RADIUS = 0.0335    # meters
-        self.PULSES_PER_METER = 2343.0
-        self.MAX_SPEED_PULSE_PER_LOOP = 25  # Maximum pulses per PID loop (40Hz)
-        self.PID_LOOPS_PER_SECOND = 40
+        self.PULSES_PER_METER = 2343
+        self.CONTROL_LOOP_RATE = 40  # Hz (matches firmware's 25ms interval)
         self.SERIAL_TIMEOUT = 0.05    # 50ms timeout for serial operations
+        
+        # Derived constants
+        self.METERS_PER_PULSE = 1.0 / self.PULSES_PER_METER
         
         # Configure QoS
         odom_qos = QoSProfile(
@@ -44,7 +46,7 @@ class RobotDriver(Node):
         self.pose = {'x': 0.0, 'y': 0.0, 'theta': 0.0}
         self.twist = {'linear': 0.0, 'angular': 0.0}
         self.wheel_positions = {'left': 0.0, 'right': 0.0}
-        self.last_encoder_readings = {'left': 0.0, 'right': 0.0}
+        self.last_encoder_readings = {'left': 0, 'right': 0}  # Raw pulses
         
         # Timing management
         self.last_cmd_time = self.get_clock().now()
@@ -65,7 +67,7 @@ class RobotDriver(Node):
         while True:
             try:
                 self.serial_port = serial.Serial(
-                    port='/dev/ttyUSB1',
+                    port='/dev/ttyUSB0',  # Changed to typical ESP32 port
                     baudrate=115200,
                     timeout=self.SERIAL_TIMEOUT,
                     write_timeout=self.SERIAL_TIMEOUT
@@ -73,17 +75,14 @@ class RobotDriver(Node):
                 break
             except serial.SerialException as e:
                 self.get_logger().error(f'Failed to open serial port: {e}')
-                time.sleep(1.0)  # Wait before retry
+                time.sleep(1.0)
 
     def send_command(self, command, expect_response=True):
         """Thread-safe serial command sending with error handling."""
         try:
             with self.serial_mutex:
-                # Clear input buffer
                 self.serial_port.reset_input_buffer()
-                
-                # Send command
-                self.serial_port.write(command.encode())
+                self.serial_port.write(f"{command}\n".encode())
                 self.serial_port.flush()
                 
                 if expect_response:
@@ -93,64 +92,55 @@ class RobotDriver(Node):
                 
         except serial.SerialException as e:
             self.get_logger().error(f'Serial error: {e}')
-            self.init_serial()  # Attempt to reconnect
+            self.init_serial()
             return None
 
     def reset_encoders(self):
         """Reset encoder values."""
-        response = self.send_command('r\n')
-        if response != 'OK':
+        response = self.send_command('r')
+        if response != 'R':
             self.get_logger().warn('Failed to reset encoders')
-            
+
     def read_encoders(self):
-        """Read encoder values with error handling."""
-        response = self.send_command('e\n')
-        if response:
+        """Read encoder values and convert to meters."""
+        response = self.send_command('e')
+        if response and response.startswith('E'):
             try:
-                left_mm, right_mm = map(float, response.split())
-                return left_mm / 1000.0, right_mm / 1000.0  # Convert to meters
+                _, left_pulses, right_pulses = response.split()
+                left_pulses = int(left_pulses)
+                right_pulses = int(right_pulses)
+                return left_pulses, right_pulses
             except (ValueError, IndexError) as e:
                 self.get_logger().error(f'Error parsing encoder values: {e}')
         return None
 
     def cmd_vel_callback(self, msg):
-        """Handle incoming velocity commands with rate limiting."""
+        """Handle incoming velocity commands."""
         try:
-            # Update command timestamp
             current_time = self.get_clock().now()
             dt = (current_time - self.last_cmd_time).nanoseconds / 1e9
             
-            # Rate limiting to 10Hz
-            if dt < 0.1:
+            # Rate limiting to match firmware control loop
+            if dt < (1.0 / self.CONTROL_LOOP_RATE):
                 return
                 
             self.last_cmd_time = current_time
             
-            # Convert velocity commands to wheel speeds
-            linear_speed = msg.linear.x
-            angular_speed = msg.angular.z
+            # Convert velocity commands to wheel velocities
+            left_vel = msg.linear.x - (msg.angular.z * self.WHEEL_SEPARATION / 2.0)
+            right_vel = msg.linear.x + (msg.angular.z * self.WHEEL_SEPARATION / 2.0)
             
-            # Calculate required pulses per PID loop
-            linear_pulses = linear_speed * self.PULSES_PER_METER / self.PID_LOOPS_PER_SECOND
-            angular_pulses = angular_speed * self.WHEEL_SEPARATION / 2.0 * \
-                           self.PULSES_PER_METER / self.PID_LOOPS_PER_SECOND
-            
-            # Calculate individual wheel speeds
-            left_pulses = int(linear_pulses - angular_pulses)
-            right_pulses = int(linear_pulses + angular_pulses)
-            
-            # Clamp values
-            left_pulses = np.clip(left_pulses, -self.MAX_SPEED_PULSE_PER_LOOP,
-                                self.MAX_SPEED_PULSE_PER_LOOP)
-            right_pulses = np.clip(right_pulses, -self.MAX_SPEED_PULSE_PER_LOOP,
-                                 self.MAX_SPEED_PULSE_PER_LOOP)
+            # Convert wheel velocities to pulses per control loop
+            # v (m/s) -> v * dt (m/interval) -> v * dt * pulses_per_m (pulses/interval)
+            left_pulses = int(left_vel * (1.0 / self.CONTROL_LOOP_RATE) * self.PULSES_PER_METER)
+            right_pulses = int(right_vel * (1.0 / self.CONTROL_LOOP_RATE) * self.PULSES_PER_METER)
             
             # Send command
-            command = f"m {left_pulses} {right_pulses}\n"
+            command = f"m {left_pulses} {right_pulses}"
             response = self.send_command(command)
             
-            if response != 'OK':
-                self.get_logger().warn('Failed to send velocity command')
+            if not response:
+                self.get_logger().warn('No response to velocity command')
                 
         except Exception as e:
             self.get_logger().error(f'Error in cmd_vel callback: {e}')
@@ -163,15 +153,19 @@ class RobotDriver(Node):
             if not readings:
                 return
                 
-            left_m, right_m = readings
+            left_pulses, right_pulses = readings
             
-            # Calculate changes
-            d_left = left_m - self.last_encoder_readings['left']
-            d_right = right_m - self.last_encoder_readings['right']
+            # Calculate changes in pulses
+            d_left_pulses = left_pulses - self.last_encoder_readings['left']
+            d_right_pulses = right_pulses - self.last_encoder_readings['right']
+            
+            # Convert pulse changes to meters
+            d_left = d_left_pulses * self.METERS_PER_PULSE
+            d_right = d_right_pulses * self.METERS_PER_PULSE
             
             # Update stored readings
-            self.last_encoder_readings['left'] = left_m
-            self.last_encoder_readings['right'] = right_m
+            self.last_encoder_readings['left'] = left_pulses
+            self.last_encoder_readings['right'] = right_pulses
             
             # Calculate robot movement
             d_center = (d_right + d_left) / 2.0
@@ -247,7 +241,7 @@ class RobotDriver(Node):
         try:
             current_time = self.get_clock().now()
             if (current_time - self.last_cmd_time).nanoseconds / 1e9 > self.CMD_TIMEOUT:
-                self.send_command('s\n')
+                self.send_command('s')
                 
         except Exception as e:
             self.get_logger().error(f'Error in watchdog: {e}')
@@ -255,7 +249,7 @@ class RobotDriver(Node):
     def cleanup(self):
         """Clean up resources before shutdown."""
         try:
-            self.send_command('s\n')  # Stop the robot
+            self.send_command('s')  # Stop the robot
             self.serial_port.close()
         except Exception as e:
             self.get_logger().error(f'Error during cleanup: {e}')
