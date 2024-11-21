@@ -18,7 +18,7 @@ class RobotDriver(Node):
         # Robot physical parameters
         self.WHEEL_SEPARATION = 0.23  # meters
         self.WHEEL_RADIUS = 0.0335    # meters
-        self.PULSES_PER_METER = 2343
+        self.PULSES_PER_METER = 4686
         self.CONTROL_LOOP_RATE = 40  # Hz (matches firmware's 25ms interval)
         self.SERIAL_TIMEOUT = 0.05    # 50ms timeout for serial operations
         
